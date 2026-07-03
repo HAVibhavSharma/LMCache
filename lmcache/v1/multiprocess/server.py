@@ -5,6 +5,8 @@ from functools import partial
 from itertools import islice
 from typing import Generator
 import argparse
+import hashlib
+import os
 import threading
 import time
 
@@ -70,6 +72,46 @@ from lmcache.v1.multiprocess.token_hasher import TokenHasher
 import lmcache.c_ops as lmc_ops
 
 logger = init_logger(__name__)
+
+
+# Environment variable that turns on KV-byte fingerprint logging. When set to
+# a truthy value ("1", "true", "yes", "on"), the server logs a SHA-1 digest of
+# every KV chunk's logical bytes on both store and retrieve, keyed by the
+# content-addressed chunk hash. Matching the STORE and RETRIEVE digests for the
+# same chunk hash (across a cold run and a warm run) proves whether the KV
+# round-trips bit-identically. Verification only — it forces a device sync on
+# the store path and hashes every chunk, so keep it off in production.
+KV_HASH_LOG_ENV_VAR = "LMCACHE_LOG_KV_HASH"
+
+
+def _kv_hash_logging_enabled() -> bool:
+    """Whether KV-byte fingerprint logging is enabled.
+
+    Returns:
+        True when ``LMCACHE_LOG_KV_HASH`` is set to "1", "true", "yes" or
+        "on" (case-insensitive, surrounding whitespace ignored); False
+        otherwise.
+    """
+    return os.getenv(KV_HASH_LOG_ENV_VAR, "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _kv_fingerprint(memory_obj: MemoryObj) -> str:
+    """Compute a short digest over a KV chunk's logical bytes.
+
+    Args:
+        memory_obj: The chunk buffer to fingerprint. ``byte_array`` exposes
+            exactly ``get_size()`` logical bytes (alignment padding excluded),
+            so the digest depends only on the KV content.
+
+    Returns:
+        The first 16 hex characters of the SHA-1 digest of the chunk bytes.
+    """
+    return hashlib.sha1(bytes(memory_obj.byte_array)).hexdigest()[:16]
 
 
 # Helper functions
@@ -422,6 +464,25 @@ class MPCacheEngine:
                     lmcache_memcpy_async_d2h(
                         gpu_context.get_tmp_gpu_buffer_flat(chunk_idx=0), memory_obj
                     )
+
+                # KV-byte verification: fingerprint each stored chunk. The D2H
+                # copies above are async on this stream, so sync before reading
+                # the CPU buffers. Gated by LMCACHE_LOG_KV_HASH (off by default).
+                if _kv_hash_logging_enabled() and reserved_dict:
+                    torch_dev.synchronize()
+                    for idx, obj_key in enumerate(obj_keys):
+                        memory_obj = reserved_dict.get(obj_key)
+                        if memory_obj is None:
+                            continue
+                        logger.info(
+                            "KVHASH STORE request_id=%s chunk_idx=%d "
+                            "chunk_hash=%s fp=%s size=%d",
+                            key.request_id,
+                            idx,
+                            chunk_hashes[idx].hex()[:16],
+                            _kv_fingerprint(memory_obj),
+                            memory_obj.get_size(),
+                        )
             except Exception:
                 logger.exception("Cannot store keys due to exception")
             finally:
@@ -632,6 +693,25 @@ class MPCacheEngine:
 
                     prefetched_keys = obj_keys[: len(memory_objs)]
                     total_bytes = sum(mo.get_size() for mo in memory_objs)
+
+                    # KV-byte verification: fingerprint each retrieved chunk
+                    # before it is copied to the GPU. These CPU buffers already
+                    # hold the stored bytes, so no sync is needed. Match a
+                    # RETRIEVE fp against the STORE fp for the same chunk_hash to
+                    # confirm the KV round-trips bit-identically. Gated by
+                    # LMCACHE_LOG_KV_HASH (off by default).
+                    if _kv_hash_logging_enabled():
+                        for idx, memory_obj in enumerate(memory_objs):
+                            logger.info(
+                                "KVHASH RETRIEVE request_id=%s chunk_idx=%d "
+                                "chunk_hash=%s fp=%s size=%d",
+                                key.request_id,
+                                idx,
+                                chunk_hashes[idx].hex()[:16],
+                                _kv_fingerprint(memory_obj),
+                                memory_obj.get_size(),
+                            )
+
                     _retrieve_loop(obj_keys, memory_objs)
                 # Only set True when with-block exits normally
                 retrieve_succeeded = True
