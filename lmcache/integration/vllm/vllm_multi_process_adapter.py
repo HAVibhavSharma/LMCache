@@ -309,6 +309,47 @@ StoreResult = bool
 RetrieveResult = bool
 LookupResult = int
 
+# Environment variable that enables full-hit-only lookups. When set to a
+# truthy value ("1", "true", "yes", "on"; case-insensitive), a lookup that
+# matches only part of the chunk-aligned prompt prefix is reported to the
+# serving engine as a complete miss instead of a partial hit, so KV is
+# only ever loaded from LMCache when the whole prefix can be served.
+FULL_HIT_ONLY_ENV_VAR = "LMCACHE_MP_FULL_HIT_ONLY"
+
+
+def _env_flag_enabled(name: str) -> bool:
+    """Check whether a boolean environment variable is enabled.
+
+    Args:
+        name: The environment variable name.
+
+    Returns:
+        True when the variable is set to "1", "true", "yes" or "on"
+        (case-insensitive, surrounding whitespace ignored); False when it
+        is unset or holds any other value.
+    """
+    return os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+@dataclass
+class _LookupContext:
+    """Per-request lookup information kept for full-hit-only mode.
+
+    Recorded when a lookup is submitted and consumed when its result is
+    checked, so a rejected partial hit can free the server-side read locks
+    it acquired. Only populated when full-hit-only mode is enabled.
+    """
+
+    token_ids: list[int]
+    """Token IDs submitted for the lookup (same list used to build the key)."""
+
+    requested_tokens: int
+    """Chunk-aligned number of tokens submitted for the lookup; a result
+    equal to this value means the full prefix was matched."""
+
+    cache_salt: str
+    """Per-user isolation salt used when the lookup key was created."""
+
 
 class LMCacheMPSchedulerAdapter:
     def __init__(
@@ -354,6 +395,19 @@ class LMCacheMPSchedulerAdapter:
         #   even after the server has already popped the job (exactly-once).
         self._pending_lookups: set[str] = set()
         self._finished_lookup_results: dict[str, int] = {}
+
+        # Full-hit-only mode: report partial prefix hits as complete misses.
+        # Controlled by the LMCACHE_MP_FULL_HIT_ONLY environment variable.
+        # _lookup_contexts keeps per-request lookup info (only populated in
+        # this mode) so rejected partial hits can free their read locks.
+        self._full_hit_only = _env_flag_enabled(FULL_HIT_ONLY_ENV_VAR)
+        self._lookup_contexts: dict[str, _LookupContext] = {}
+        if self._full_hit_only:
+            logger.info(
+                "%s is enabled: partial prefix hits will be "
+                "reported as misses and never loaded from LMCache",
+                FULL_HIT_ONLY_ENV_VAR,
+            )
 
         self.model_name = model_name
         self.parallel_strategy = parallel_strategy
@@ -477,6 +531,12 @@ class LMCacheMPSchedulerAdapter:
             self._health_event.clear()
             return
         self._pending_lookups.add(request_id)
+        if self._full_hit_only:
+            self._lookup_contexts[request_id] = _LookupContext(
+                token_ids=token_ids,
+                requested_tokens=aligned_end,
+                cache_salt=cache_salt,
+            )
 
     @_lmcache_nvtx_annotate
     def check_lookup_result(self, request_id: str) -> int | None:
@@ -495,6 +555,9 @@ class LMCacheMPSchedulerAdapter:
             An integer representing the total number of tokens matched
             in LMCache (prefix matching), or
             None if the lookup request is not finished yet.
+            When full-hit-only mode is enabled (see
+            ``LMCACHE_MP_FULL_HIT_ONLY``), a partial prefix hit is reported
+            as 0 and its server-side read locks are released.
         """
         if request_id not in self._pending_lookups:
             # No job — either unhealthy at submit time or already cleaned up.
@@ -528,8 +591,49 @@ class LMCacheMPSchedulerAdapter:
             return None
 
         token_count = result * self.chunk_size
+        if self._full_hit_only:
+            token_count = self._reject_partial_hit(request_id, token_count)
         self._finished_lookup_results[request_id] = token_count
         return token_count
+
+    def _reject_partial_hit(self, request_id: str, token_count: int) -> int:
+        """Downgrade a partial prefix hit to a miss in full-hit-only mode.
+
+        Compares the matched token count against the chunk-aligned token
+        count submitted for the lookup. On a partial hit, frees the
+        server-side read locks held on the matched chunks (so they do not
+        linger until TTL expiry) and reports a miss.
+
+        Args:
+            request_id: The ID of the lookup request.
+            token_count: The number of tokens matched by the lookup.
+
+        Returns:
+            The original ``token_count`` on a full hit or a miss; 0 when
+            the hit was partial and has been rejected.
+        """
+        context = self._lookup_contexts.get(request_id)
+        if context is None or token_count == 0:
+            return token_count
+        if token_count >= context.requested_tokens:
+            return token_count
+
+        logger.info(
+            "Rejecting partial prefix hit for request %s: "
+            "%d/%d tokens matched (%s is enabled)",
+            request_id,
+            token_count,
+            context.requested_tokens,
+            FULL_HIT_ONLY_ENV_VAR,
+        )
+        self.free_lookup_locks(
+            token_ids=context.token_ids,
+            start=0,
+            end=token_count,
+            request_id=request_id,
+            cache_salt=context.cache_salt,
+        )
+        return 0
 
     def num_blocks_per_chunk(self) -> int:
         """
@@ -546,6 +650,7 @@ class LMCacheMPSchedulerAdapter:
         """
         self._pending_lookups.discard(request_id)
         self._finished_lookup_results.pop(request_id, None)
+        self._lookup_contexts.pop(request_id, None)
 
     def free_lookup_locks(
         self,
