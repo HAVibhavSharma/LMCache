@@ -11,6 +11,7 @@ import threading
 import time
 
 # Third Party
+import torch
 import zmq
 
 # First Party
@@ -82,6 +83,68 @@ logger = init_logger(__name__)
 # round-trips bit-identically. Verification only — it forces a device sync on
 # the store path and hashes every chunk, so keep it off in production.
 KV_HASH_LOG_ENV_VAR = "LMCACHE_LOG_KV_HASH"
+
+
+# multi_layer_block_kv_transfer moves 1-4 LMCache objects per launch.
+_KERNEL_MAX_OBJECTS = 4
+
+
+def _contiguous_runs(chunk_ids: list[int]) -> list[tuple[int, int]]:
+    """Ascending chunk ids as (first id, length) runs of consecutive ids."""
+    runs: list[tuple[int, int]] = []
+    for idx in chunk_ids:
+        if runs and runs[-1][0] + runs[-1][1] == idx:
+            runs[-1] = (runs[-1][0], runs[-1][1] + 1)
+        else:
+            runs.append((idx, 1))
+    return runs
+
+
+def _block_kv_transfer(
+    gpu_context: GPUCacheContext,
+    all_block_ids_gpu: torch.Tensor,
+    *,
+    first_chunk: int,
+    num_chunks: int,
+    first_slot: int,
+    blocks_per_chunk: int,
+    direction: "lmc_ops.TransferDirection",
+    skip_blocks: int = 0,
+) -> None:
+    """Move consecutive chunks ``first_chunk`` onward between the paged KV
+    cache and temporary-buffer slots ``first_slot`` onward, for every group.
+
+    One kernel launch per group per ``_KERNEL_MAX_OBJECTS`` chunks, all
+    enqueued back to back on the current stream. ``skip_blocks`` counts from
+    the first chunk's first block, as the kernel's ``skip_prefix_n_blocks``
+    does within one launch; a launch it covers entirely is not made.
+    """
+    num_groups = gpu_context.kv_layer_groups_manager.num_groups
+    for offset in range(0, num_chunks, _KERNEL_MAX_OBJECTS):
+        count = min(_KERNEL_MAX_OBJECTS, num_chunks - offset)
+        launch_blocks = count * blocks_per_chunk
+        skip = min(max(skip_blocks - offset * blocks_per_chunk, 0), launch_blocks)
+        if skip == launch_blocks:
+            continue
+        start = (first_chunk + offset) * blocks_per_chunk
+        block_ids = all_block_ids_gpu[start : start + launch_blocks]
+        for group_idx in range(num_groups):
+            lmc_ops.multi_layer_block_kv_transfer(
+                gpu_context.get_group_kv_pointers(group_idx),
+                [
+                    gpu_context.get_tmp_chunk_ptr(first_slot + offset + i, group_idx)
+                    for i in range(count)
+                ],
+                block_ids,
+                gpu_context.device,
+                direction,
+                gpu_context.get_shape_desc(group_idx),
+                # Kernel contract: the number of *physical* slots per chunk
+                # for this group (= logical chunk_size // compress_ratio).
+                gpu_context.get_physical_chunk_size(group_idx),
+                gpu_context.gpu_kv_format_,
+                skip,
+            )
 
 
 def _kv_hash_logging_enabled() -> bool:
@@ -424,46 +487,40 @@ class MPCacheEngine:
                     obj_keys, layout_desc, "new"
                 )
 
-                # NOTE: Store is not batched because some obj_keys may be
-                # skipped (not in reserved_dict), making block_ids
-                # non-contiguous. Batching would require torch.cat to
-                # reassemble block_ids, negating the benefit.
-                num_groups = gpu_context.kv_layer_groups_manager.num_groups
-                for idx, obj_key in enumerate(obj_keys):
-                    if obj_key in reserved_dict:
-                        memory_obj = reserved_dict[obj_key]
-                    else:
-                        continue
-
-                    chunk_block_ids_gpu = all_block_ids_gpu[
-                        idx * blocks_per_chunk : (idx + 1) * blocks_per_chunk
-                    ]
-
-                    # Copy from GPU paged buffer to tmp buffer, then to CPU — per group
-                    for group_idx in range(num_groups):
-                        tmp_buffer = gpu_context.get_tmp_chunk_gpu_buffer(group_idx)
-                        group_kv_pointers = gpu_context.get_group_kv_pointers(group_idx)
-                        # Kernel contract: ``group_lmcache_chunk_size`` here is the
-                        # number of *physical* slots per chunk for this group
-                        # (= logical chunk_size // compress_ratio).
-                        group_lmcache_chunk_size = gpu_context.get_physical_chunk_size(
-                            group_idx
+                # In rounds of up to max_batch_size chunks, every gather of a
+                # round enqueued before any of its D2H copies. Without MPS the
+                # GPU time-slices between this process and the inference
+                # engine, and a gather queued behind a copy finds the SMs
+                # handed back to the engine: one turn on the GPU, and two
+                # context switches, per chunk. Chunks skipped by
+                # reserve_write (already stored) leave the kept ones
+                # non-contiguous, so a round's gathers go per run of
+                # consecutive chunks, each reading its own slice of the
+                # staged block ids.
+                kept = [
+                    idx
+                    for idx, obj_key in enumerate(obj_keys)
+                    if obj_key in reserved_dict
+                ]
+                for first in range(0, len(kept), gpu_context.max_batch_size):
+                    batch = kept[first : first + gpu_context.max_batch_size]
+                    slot = 0
+                    for run_start, run_len in _contiguous_runs(batch):
+                        _block_kv_transfer(
+                            gpu_context,
+                            all_block_ids_gpu,
+                            first_chunk=run_start,
+                            num_chunks=run_len,
+                            first_slot=slot,
+                            blocks_per_chunk=blocks_per_chunk,
+                            direction=lmc_ops.TransferDirection.D2H,
                         )
-                        lmc_ops.multi_layer_block_kv_transfer(
-                            group_kv_pointers,
-                            [tmp_buffer.data_ptr()],
-                            chunk_block_ids_gpu,
-                            gpu_context.device,
-                            lmc_ops.TransferDirection.D2H,
-                            gpu_context.get_shape_desc(group_idx),
-                            group_lmcache_chunk_size,
-                            gpu_context.gpu_kv_format_,
-                            0,
+                        slot += run_len
+                    for slot, idx in enumerate(batch):
+                        lmcache_memcpy_async_d2h(
+                            gpu_context.get_tmp_gpu_buffer_flat(chunk_idx=slot),
+                            reserved_dict[obj_keys[idx]],
                         )
-                    # Store is not batched, so we always use chunk_idx=0 (single slot)
-                    lmcache_memcpy_async_d2h(
-                        gpu_context.get_tmp_gpu_buffer_flat(chunk_idx=0), memory_obj
-                    )
 
                 # KV-byte verification: fingerprint each stored chunk. The D2H
                 # copies above are async on this stream, so sync before reading
@@ -603,7 +660,6 @@ class MPCacheEngine:
 
         def _retrieve_loop(keys: list[ObjectKey], memory_objs: list[MemoryObj]) -> None:
             _BATCH_SIZE = gpu_context.max_batch_size
-            num_groups = gpu_context.kv_layer_groups_manager.num_groups
             for batch_idx, memory_obj_batch in enumerate(
                 batched_iteration(memory_objs, batch_size=_BATCH_SIZE)
             ):
@@ -636,38 +692,27 @@ class MPCacheEngine:
                 skip_blocks_in_chunk = skip_tokens_in_chunk // ie_logical_block_size
 
                 start_chunk_id = batch_idx * _BATCH_SIZE
-                end_chunk_id = start_chunk_id + batch_len
-                chunk_block_ids_gpu = all_block_ids_gpu[
-                    start_chunk_id * blocks_per_chunk : end_chunk_id * blocks_per_chunk
-                ]
 
-                # Copy from CPU to GPU tmp buffers, then scatter to paged KV — per group
-                # H2D copy: each memory_obj maps to its own batch slot
+                # Copy from CPU to GPU tmp buffers, then scatter to paged KV.
+                # H2D copy: each memory_obj maps to its own batch slot. All
+                # of the batch's copies go first and all of its scatters
+                # after, so the scatters run back to back in one turn on the
+                # GPU (see the store path).
                 for chunk_idx, memory_obj in enumerate(memory_obj_batch):
                     lmcache_memcpy_async_h2d(
                         memory_obj,
                         gpu_context.get_tmp_gpu_buffer_flat(chunk_idx=chunk_idx),
                     )
-                for group_idx in range(num_groups):
-                    tmp_buffers = gpu_context.get_tmp_chunk_gpu_buffer_batched(
-                        batch_len, group_idx
-                    )
-                    group_kv_pointers = gpu_context.get_group_kv_pointers(group_idx)
-                    group_lmcache_chunk_size = gpu_context.get_physical_chunk_size(
-                        group_idx
-                    )
-
-                    lmc_ops.multi_layer_block_kv_transfer(
-                        group_kv_pointers,
-                        [tb.data_ptr() for tb in tmp_buffers],
-                        chunk_block_ids_gpu,
-                        gpu_context.device,
-                        lmc_ops.TransferDirection.H2D,
-                        gpu_context.get_shape_desc(group_idx),
-                        group_lmcache_chunk_size,
-                        gpu_context.gpu_kv_format_,
-                        skip_blocks_in_chunk,
-                    )
+                _block_kv_transfer(
+                    gpu_context,
+                    all_block_ids_gpu,
+                    first_chunk=start_chunk_id,
+                    num_chunks=batch_len,
+                    first_slot=0,
+                    blocks_per_chunk=blocks_per_chunk,
+                    direction=lmc_ops.TransferDirection.H2D,
+                    skip_blocks=skip_blocks_in_chunk,
+                )
 
         with (
             torch_dev.device(gpu_context.device),

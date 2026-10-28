@@ -417,3 +417,31 @@ class TestMultiGroup:
             assert region.max().item() == gidx + 1, (
                 f"Group {gidx} flat region has wrong max value"
             )
+
+
+# ---------------------------------------------------------------------------
+# get_tmp_chunk_ptr tests
+# ---------------------------------------------------------------------------
+
+
+class TestGetTmpChunkPtr:
+    """get_tmp_chunk_ptr is the batched view's data_ptr, without the view."""
+
+    GROUPS = [
+        {"num_layers": 2, "num_heads": 8, "head_size": 128},
+        {"num_layers": 2, "num_heads": 4, "head_size": 64, "dtype": torch.float16},
+    ]
+
+    def test_matches_batched_views(self) -> None:
+        ctx = _make_context_multi_group(self.GROUPS, chunk_size=16)
+        num_groups = len(ctx.kv_layer_groups_manager_.kv_layer_groups)
+        for gidx in range(num_groups):
+            views = ctx.get_tmp_chunk_gpu_buffer_batched(ctx.max_batch_size, gidx)
+            assert [
+                ctx.get_tmp_chunk_ptr(i, gidx) for i in range(ctx.max_batch_size)
+            ] == [v.data_ptr() for v in views]
+
+    def test_out_of_range_raises(self) -> None:
+        ctx = _make_context(chunk_size=16)
+        with pytest.raises(ValueError):
+            ctx.get_tmp_chunk_ptr(ctx.max_batch_size)

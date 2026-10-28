@@ -10,6 +10,7 @@ This module provides GPU-side KV cache management functionality, including:
 # Standard
 from typing import Any
 import array
+import os
 
 # Third Party
 import cupy
@@ -44,6 +45,27 @@ from lmcache.v1.multiprocess.custom_types import (
 import lmcache.c_ops as lmc_ops
 
 logger = init_logger(__name__)
+
+# Tokens of KV the temporary GPU buffer holds: one transfer round of a store
+# or a load. At the default chunk size (256) that is the 4 chunks the buffer
+# always held; at a small chunk size it is that many more chunks, so a round
+# still moves ~1024 tokens instead of 4 chunks' worth. Each round costs the
+# server one turn on the GPU when it time-slices with the inference engine.
+TRANSFER_BATCH_TOKENS_ENV_VAR = "LMCACHE_MP_TRANSFER_BATCH_TOKENS"
+_DEFAULT_TRANSFER_BATCH_TOKENS = 1024
+# Never fewer chunks per round than before the buffer was sized in tokens.
+_MIN_TRANSFER_BATCH_CHUNKS = 4
+
+
+def transfer_batch_chunks(chunk_size: int) -> int:
+    """Chunks per transfer round (``GPUCacheContext.max_batch_size``).
+
+    ``LMCACHE_MP_TRANSFER_BATCH_TOKENS`` (default 1024) tokens' worth of
+    chunks, and never fewer than 4.
+    """
+    raw = os.getenv(TRANSFER_BATCH_TOKENS_ENV_VAR, "").strip()
+    tokens = int(raw) if raw else _DEFAULT_TRANSFER_BATCH_TOKENS
+    return max(_MIN_TRANSFER_BATCH_CHUNKS, tokens // chunk_size)
 
 
 def unwrap_kv_cache_tensors(kv_caches: KVCache) -> list[torch.Tensor]:
@@ -118,7 +140,7 @@ class GPUCacheContext:
         # This lets callers copy an entire chunk to/from a MemoryObj with a
         # single memcpy, without needing to know the per-group layout.
         # max_batch_size is the max number of chunks processed concurrently.
-        self.max_batch_size = 4
+        self.max_batch_size = transfer_batch_chunks(lmcache_logical_chunk_size)
         # Byte size of one chunk entry (= one chunk across all groups).
         # tmp_chunk_group_offsets_[g] is the byte offset of group g within
         # a single chunk; tmp_chunk_group_offsets_[num_groups] ==
@@ -308,6 +330,26 @@ class GPUCacheContext:
             )
         start = chunk_idx * self.tmp_chunk_bytes_
         return self.tmp_gpu_buffer_[start : start + self.tmp_chunk_bytes_]
+
+    def get_tmp_chunk_ptr(self, chunk_idx: int, group_idx: int = 0) -> int:
+        """Device address of one group's region in temporary-buffer slot
+        ``chunk_idx`` -- what ``get_tmp_chunk_gpu_buffer_batched(...)
+        [chunk_idx].data_ptr()`` returns, without building a tensor view per
+        slot: a transfer round hands the kernel one per chunk per group.
+
+        Args:
+            chunk_idx: Chunk index (0 <= chunk_idx < max_batch_size).
+            group_idx: Index of the KV layer group (default 0).
+        """
+        if chunk_idx >= self.max_batch_size:
+            raise ValueError(
+                f"chunk_idx {chunk_idx} exceeds max_batch_size {self.max_batch_size}"
+            )
+        return (
+            self.tmp_gpu_buffer_.data_ptr()
+            + chunk_idx * self.tmp_chunk_bytes_
+            + self.tmp_chunk_group_offsets_[group_idx]
+        )
 
     def get_tmp_chunk_gpu_buffer(self, group_idx: int = 0) -> torch.Tensor:
         """
