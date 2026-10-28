@@ -178,8 +178,40 @@ def test_store_round_plan(launches):
     ],
 )
 def test_transfer_batch_chunks(monkeypatch, chunk_size, env, expected):
+    monkeypatch.delenv(gpu_context_mod.BATCHED_TRANSFER_ENV_VAR, raising=False)
     if env is None:
         monkeypatch.delenv(gpu_context_mod.TRANSFER_BATCH_TOKENS_ENV_VAR, raising=False)
     else:
         monkeypatch.setenv(gpu_context_mod.TRANSFER_BATCH_TOKENS_ENV_VAR, env)
     assert gpu_context_mod.transfer_batch_chunks(chunk_size) == expected
+
+
+@pytest.mark.parametrize("value", ["0", "false", "off"])
+def test_batched_transfer_off_restores_four_chunk_rounds(monkeypatch, value):
+    monkeypatch.setenv(gpu_context_mod.BATCHED_TRANSFER_ENV_VAR, value)
+    monkeypatch.setenv(gpu_context_mod.TRANSFER_BATCH_TOKENS_ENV_VAR, "1024")
+    assert not gpu_context_mod.batched_transfer_enabled()
+    assert gpu_context_mod.transfer_batch_chunks(16) == 4
+
+
+def test_batched_transfer_on_by_default(monkeypatch):
+    monkeypatch.delenv(gpu_context_mod.BATCHED_TRANSFER_ENV_VAR, raising=False)
+    assert gpu_context_mod.batched_transfer_enabled()
+
+
+def test_a_round_of_one_is_the_old_store(launches):
+    """store_batch_size 1: each kept chunk gathered alone into slot 0."""
+    ctx = _fake_context()
+    for idx in [0, 1, 5]:
+        for run_start, run_len in server._contiguous_runs([idx]):
+            server._block_kv_transfer(
+                ctx,
+                torch.arange(12),
+                first_chunk=run_start,
+                num_chunks=run_len,
+                first_slot=0,
+                blocks_per_chunk=2,
+                direction=D2H,
+            )
+    assert [c["slots"] for c in launches] == [[0], [0], [0]]
+    assert [c["blocks"] for c in launches] == [[0, 1], [2, 3], [10, 11]]

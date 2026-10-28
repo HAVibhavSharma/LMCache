@@ -55,14 +55,31 @@ TRANSFER_BATCH_TOKENS_ENV_VAR = "LMCACHE_MP_TRANSFER_BATCH_TOKENS"
 _DEFAULT_TRANSFER_BATCH_TOKENS = 1024
 # Never fewer chunks per round than before the buffer was sized in tokens.
 _MIN_TRANSFER_BATCH_CHUNKS = 4
+# "0" restores the transfers as they were before rounds: a store gathers and
+# copies one chunk at a time, a load moves 4 chunks at a time. For measuring
+# what the rounds are worth against the same build.
+BATCHED_TRANSFER_ENV_VAR = "LMCACHE_MP_BATCHED_TRANSFER"
+
+
+def batched_transfer_enabled() -> bool:
+    """Whether stores and loads go in token-sized rounds (the default)."""
+    return os.getenv(BATCHED_TRANSFER_ENV_VAR, "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
 
 
 def transfer_batch_chunks(chunk_size: int) -> int:
     """Chunks per transfer round (``GPUCacheContext.max_batch_size``).
 
     ``LMCACHE_MP_TRANSFER_BATCH_TOKENS`` (default 1024) tokens' worth of
-    chunks, and never fewer than 4.
+    chunks, and never fewer than 4; always 4 with
+    ``LMCACHE_MP_BATCHED_TRANSFER=0``.
     """
+    if not batched_transfer_enabled():
+        return _MIN_TRANSFER_BATCH_CHUNKS
     raw = os.getenv(TRANSFER_BATCH_TOKENS_ENV_VAR, "").strip()
     tokens = int(raw) if raw else _DEFAULT_TRANSFER_BATCH_TOKENS
     return max(_MIN_TRANSFER_BATCH_CHUNKS, tokens // chunk_size)
@@ -141,6 +158,17 @@ class GPUCacheContext:
         # single memcpy, without needing to know the per-group layout.
         # max_batch_size is the max number of chunks processed concurrently.
         self.max_batch_size = transfer_batch_chunks(lmcache_logical_chunk_size)
+        # Chunks a store gathers before it copies any: a whole round, or
+        # with LMCACHE_MP_BATCHED_TRANSFER=0 one, as before rounds.
+        self.store_batch_size = (
+            self.max_batch_size if batched_transfer_enabled() else 1
+        )
+        logger.info(
+            "Transfers: %d chunks of %d tokens per round, stores %s",
+            self.max_batch_size,
+            lmcache_logical_chunk_size,
+            "batched" if self.store_batch_size > 1 else "one chunk at a time",
+        )
         # Byte size of one chunk entry (= one chunk across all groups).
         # tmp_chunk_group_offsets_[g] is the byte offset of group g within
         # a single chunk; tmp_chunk_group_offsets_[num_groups] ==

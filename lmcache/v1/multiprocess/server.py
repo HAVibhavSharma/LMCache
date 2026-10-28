@@ -487,8 +487,10 @@ class MPCacheEngine:
                     obj_keys, layout_desc, "new"
                 )
 
-                # In rounds of up to max_batch_size chunks, every gather of a
-                # round enqueued before any of its D2H copies. Without MPS the
+                # In rounds of up to store_batch_size chunks (max_batch_size;
+                # 1 with LMCACHE_MP_BATCHED_TRANSFER=0, the old per-chunk
+                # path), every gather of a round enqueued before any of its
+                # D2H copies. Without MPS the
                 # GPU time-slices between this process and the inference
                 # engine, and a gather queued behind a copy finds the SMs
                 # handed back to the engine: one turn on the GPU, and two
@@ -502,8 +504,8 @@ class MPCacheEngine:
                     for idx, obj_key in enumerate(obj_keys)
                     if obj_key in reserved_dict
                 ]
-                for first in range(0, len(kept), gpu_context.max_batch_size):
-                    batch = kept[first : first + gpu_context.max_batch_size]
+                for first in range(0, len(kept), gpu_context.store_batch_size):
+                    batch = kept[first : first + gpu_context.store_batch_size]
                     slot = 0
                     for run_start, run_len in _contiguous_runs(batch):
                         _block_kv_transfer(
