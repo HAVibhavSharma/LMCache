@@ -11,6 +11,7 @@ temporary-buffer slots and which skip each launch gets -- against a recorded
 
 # Standard
 from types import SimpleNamespace
+import inspect
 
 # Third Party
 import pytest
@@ -215,3 +216,20 @@ def test_a_round_of_one_is_the_old_store(launches):
             )
     assert [c["slots"] for c in launches] == [[0], [0], [0]]
     assert [c["blocks"] for c in launches] == [[0, 1], [2, 3], [10, 11]]
+
+
+def test_batched_store_stages_block_ids_after_waiting_on_vllm():
+    """Staged before the wait, the block-id copy runs the moment it is
+    enqueued and takes a GPU turn of its own; staged after it, the copy runs
+    back to back with the gathers. The per-chunk path keeps the old order."""
+    src = inspect.getsource(server.MPCacheEngine.store)
+    wait = src.index("vllm_event.wait(")
+    before = src.index("if not batched:\n")
+    after = src.index("if batched:\n")
+    stages = [
+        i
+        for i in range(len(src))
+        if src.startswith("all_block_ids_gpu = gpu_context.stage_block_ids(", i)
+    ]
+    assert len(stages) == 2
+    assert before < stages[0] < wait < after < stages[1]

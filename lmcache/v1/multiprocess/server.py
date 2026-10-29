@@ -440,8 +440,12 @@ class MPCacheEngine:
             check_interprocess_event_support()
             event = torch_dev.Event(interprocess=True)
 
-            # Stage all block_ids to GPU once before the loop
-            all_block_ids_gpu = gpu_context.stage_block_ids(gpu_block_ids)
+            # The per-chunk path (LMCACHE_MP_BATCHED_TRANSFER=0) keeps the old
+            # order, staging before the wait, so it stays the transfers it was
+            # measured with. The batched path stages after the wait (below).
+            batched = gpu_context.store_batch_size > 1
+            if not batched:
+                all_block_ids_gpu = gpu_context.stage_block_ids(gpu_block_ids)
 
             # Wait for vLLM to finish
             # Not all backends support IPC event handles (CUDA IPC specific)
@@ -455,6 +459,15 @@ class MPCacheEngine:
                 gpu_context.device, event_ipc_handle
             )
             vllm_event.wait(stream=gpu_context.stream)
+
+            # Stage all block_ids to GPU once before the loop -- after the
+            # wait, so the copy runs back to back with the gathers that read
+            # it. Staged first, it ran the moment it was enqueued, usually
+            # mid-step for vLLM, and without MPS took a GPU turn of its own:
+            # one per store, besides the turn the gathers take once vLLM's
+            # event fires.
+            if batched:
+                all_block_ids_gpu = gpu_context.stage_block_ids(gpu_block_ids)
 
             # CPU-synchronous sentinel: a GPU store is about to be enqueued.
             # Must be published via publish() (not publish_on_stream) so the
