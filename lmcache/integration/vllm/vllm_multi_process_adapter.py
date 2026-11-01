@@ -350,8 +350,17 @@ class _LookupContext:
     cache_salt: str
     """Per-user isolation salt used when the lookup key was created."""
 
+    start: int = 0
+    """Chunk-aligned token index the lookup started from; only chunks from
+    here on were read-locked."""
+
 
 class LMCacheMPSchedulerAdapter:
+    # `maybe_submit_lookup_request` takes `start`, and the server this adapter
+    # ships with looks up from there (MPCacheEngine.lookup). vLLM's connector
+    # checks this before starting lookups past token 0.
+    supports_lookup_start = True
+
     def __init__(
         self,
         server_url: str,
@@ -472,6 +481,7 @@ class LMCacheMPSchedulerAdapter:
         request_id: str,
         token_ids: list[int],
         cache_salt: str = "",
+        start: int = 0,
     ):
         """
         Submit a new lookup request to LMCache if there is no ongoing request.
@@ -486,6 +496,11 @@ class LMCacheMPSchedulerAdapter:
             token_ids: Token IDs to lookup from LMCache
             cache_salt: Per-user isolation salt. Requests with different
                 cache_salt values produce separate cache entries.
+            start: Token index to look up from, for a caller that already
+                holds the tokens before it (vLLM's prefix-cache hit).  Rounded
+                down to the chunk size.  Only chunks from there on are looked
+                up, read-locked and loaded; the result still counts tokens
+                from 0, the skipped ones included.
 
         Returns:
             None
@@ -507,10 +522,13 @@ class LMCacheMPSchedulerAdapter:
             return
 
         aligned_end = (len(token_ids) // self.chunk_size) * self.chunk_size
+        aligned_start = min(
+            (max(start, 0) // self.chunk_size) * self.chunk_size, aligned_end
+        )
 
         key = self._create_key(
             token_ids,
-            start=0,
+            start=aligned_start,
             end=aligned_end,
             request_id=request_id,
             cache_salt=cache_salt,
@@ -536,6 +554,7 @@ class LMCacheMPSchedulerAdapter:
                 token_ids=token_ids,
                 requested_tokens=aligned_end,
                 cache_salt=cache_salt,
+                start=aligned_start,
             )
 
     @_lmcache_nvtx_annotate
@@ -626,9 +645,10 @@ class LMCacheMPSchedulerAdapter:
             context.requested_tokens,
             FULL_HIT_ONLY_ENV_VAR,
         )
+        # Only chunks from the lookup's start were locked.
         self.free_lookup_locks(
             token_ids=context.token_ids,
-            start=0,
+            start=context.start,
             end=token_count,
             request_id=request_id,
             cache_salt=context.cache_salt,

@@ -276,6 +276,11 @@ class _PrefetchJob:
     # tenant / isolation domain (an empty string means no salt set).
     model_name: str = ""
     cache_salt: str = ""
+    # Chunks before ``key.start`` that the caller already holds and did not
+    # ask about.  They are added to the hit count reported back, which
+    # always counts from token 0, so a caller that starts its lookup past 0
+    # reads the result the same way as one that does not.
+    skipped_chunks: int = 0
 
 
 # Main class for the mp cache engine
@@ -885,8 +890,16 @@ class MPCacheEngine:
 
         extra_count = compute_extra_count(tp_size, world_size)
 
-        # Compute chunk hashes for all full chunks
-        chunk_hashes = self.token_hasher.compute_chunk_hashes(list(key.token_ids))
+        # A lookup may start past token 0 when the caller (vLLM) already holds
+        # the first ``key.start`` tokens: only the chunks from there on are
+        # looked up, locked and loaded.  The rolling hash still runs from 0.
+        start = (max(key.start, 0) // self.chunk_size) * self.chunk_size
+        skipped_chunks = start // self.chunk_size
+
+        # Compute chunk hashes for all full chunks from ``start``
+        chunk_hashes = self.token_hasher.compute_chunk_hashes(
+            list(key.token_ids), start=start
+        )
         if not chunk_hashes:
             self._register_prefetch_job(
                 _PrefetchJob(
@@ -902,6 +915,7 @@ class MPCacheEngine:
                     requested_tokens=0,
                     model_name=model_name,
                     cache_salt=key.cache_salt,
+                    skipped_chunks=skipped_chunks,
                 )
             )
             return
@@ -955,6 +969,7 @@ class MPCacheEngine:
                 requested_tokens=requested_tokens,
                 model_name=model_name,
                 cache_salt=key.cache_salt,
+                skipped_chunks=skipped_chunks,
             )
         )
 
@@ -987,7 +1002,7 @@ class MPCacheEngine:
         if found_count is None:
             return None
 
-        found_count = found_count // job.world_size
+        found_count = found_count // job.world_size + job.skipped_chunks
         return found_count
 
     def query_prefetch_status(
@@ -1045,7 +1060,9 @@ class MPCacheEngine:
         with self._prefetch_job_lock:
             self._prefetch_jobs.pop(request_id, None)
 
-        return found_count
+        # The event above reports what this lookup found; the caller gets the
+        # count from token 0, including the chunks it said it already holds.
+        return found_count + job.skipped_chunks
 
     def free_lookup_locks(
         self,
