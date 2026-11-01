@@ -915,23 +915,32 @@ class TestExtraCountPrefetch:
         ctrl.stop()
         adapter.close()
 
-    def test_extra_count_non_prefix_loaded_keys_fully_released(self, l1_manager):
+    def test_extra_count_non_prefix_loaded_keys_fully_released(
+        self, l1_manager, monkeypatch
+    ):
         """Keys loaded beyond the prefix (due to partial load failure) must
         have ALL extra locks released by _finalize_load so they can be evicted.
 
-        We simulate this by storing keys {0, 1, 2} in L2 but making key 1
-        fail to reserve in L1 (by pre-occupying it), creating a gap so that
-        key 2 is loaded but lies beyond the prefix.  _finalize_load must
-        release 1 + extra_count locks for key 2.
+        We simulate this by storing keys {0, 1, 2} in L2 but holding key 1
+        write-locked in L1 for longer than the controller waits on a block
+        being written, creating a gap so that key 2 is loaded but lies beyond
+        the prefix.  _finalize_load must release 1 + extra_count locks for
+        key 2.
         """
+        # First Party
+        from lmcache.v1.distributed.storage_controllers import prefetch_controller
+
+        # The controller waits on a write-locked block; keep that wait short.
+        monkeypatch.setattr(prefetch_controller, "JOIN_TIMEOUT_S", 0.2)
         adapter = make_adapter()
         layout = make_layout()
         keys = [make_object_key(i) for i in range(3)]
         store_keys_in_l2(adapter, keys, layout)
 
-        # Pre-occupy key[1] in L1 with a write lock so reserve_write fails for it.
-        # This forces a gap: key 0 is prefix (hit), key 1 fails reservation
-        # (gap), key 2 is loaded but beyond the prefix.
+        # Pre-occupy key[1] in L1 with a write lock that is never released.
+        # This forces a gap: key 0 is prefix (hit), key 1 is waited on until
+        # JOIN_TIMEOUT_S and then counts as a miss (gap), key 2 is loaded but
+        # beyond the prefix.
         pre_write_results = l1_manager.reserve_write(
             keys=[keys[1]],
             is_temporary=[False],
@@ -950,7 +959,7 @@ class TestExtraCountPrefetch:
 
         req_id = ctrl.submit_prefetch_request(keys, layout, extra_count=1)
         result = wait_for_prefetch_result(ctrl, req_id)
-        # Only key 0 is in the prefix (key 1 reservation failed → gap)
+        # Only key 0 is in the prefix (key 1 never became readable → gap)
         assert result == 1, f"Expected 1 prefix hit, got {result}"
 
         # key[0] should be in L1 with 2 read locks (1 + extra_count=1)
