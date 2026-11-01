@@ -202,6 +202,8 @@ class FSL2AdapterConfig(L2AdapterConfigBase):
     - relative_tmp_dir: optional relative sub-dir for
       temp files (same as fs_connector_relative_tmp_dir).
     - max_capacity_gb: optional cap on what the adapter keeps on disk.
+    - max_concurrent_io: file reads (and existence checks) one load (or
+      lookup) keeps in flight.
     """
 
     def __init__(
@@ -211,6 +213,7 @@ class FSL2AdapterConfig(L2AdapterConfigBase):
         read_ahead_size: Optional[int] = None,
         use_odirect: bool = False,
         max_capacity_gb: Optional[float] = None,
+        max_concurrent_io: int = 8,
     ):
         """Initialize FSL2AdapterConfig.
 
@@ -230,12 +233,18 @@ class FSL2AdapterConfig(L2AdapterConfigBase):
                 L2 eviction controller asks, so an ``"eviction"`` block in
                 the adapter's spec keeps the directory under it. Unset,
                 the directory grows without bound, as before.
+            max_concurrent_io: How many files one load task reads at once,
+                and how many existence checks one lookup runs at once. One
+                at a time keeps a fast SSD at queue depth 1 -- about
+                0.5 GB/s for 5 MB files, no faster than recomputing the
+                KV. 1 restores that.
         """
         self.base_path = base_path
         self.relative_tmp_dir = relative_tmp_dir
         self.read_ahead_size = read_ahead_size
         self.use_odirect = use_odirect
         self.max_capacity_gb = max_capacity_gb
+        self.max_concurrent_io = max_concurrent_io
 
     @classmethod
     def from_dict(cls, d: dict) -> "FSL2AdapterConfig":
@@ -260,12 +269,20 @@ class FSL2AdapterConfig(L2AdapterConfigBase):
             or max_capacity_gb <= 0
         ):
             raise ValueError("max_capacity_gb must be a positive number")
+        max_concurrent_io = d.get("max_concurrent_io", 8)
+        if (
+            isinstance(max_concurrent_io, bool)
+            or not isinstance(max_concurrent_io, int)
+            or max_concurrent_io < 1
+        ):
+            raise ValueError("max_concurrent_io must be a positive integer")
         return cls(
             base_path=base_path,
             relative_tmp_dir=relative_tmp_dir,
             read_ahead_size=read_ahead_size,
             use_odirect=use_odirect,
             max_capacity_gb=max_capacity_gb,
+            max_concurrent_io=max_concurrent_io,
         )
 
     @classmethod
@@ -284,7 +301,10 @@ class FSL2AdapterConfig(L2AdapterConfigBase):
             "via O_DIRECT (optional, default false)\n"
             "- max_capacity_gb (float): cap on the bytes kept "
             "on disk, enforced by an \"eviction\" block "
-            "(optional, default unbounded)"
+            "(optional, default unbounded)\n"
+            "- max_concurrent_io (int): files one load reads at "
+            "once, and existence checks one lookup runs at once "
+            "(optional, default 8; 1 = one at a time)"
         )
 
 
@@ -329,6 +349,7 @@ class FSL2Adapter(L2AdapterInterface):
         # I/O tuning options aligned with FSConnector
         self._read_ahead_size = config.read_ahead_size
         self._use_odirect = config.use_odirect
+        self._io_depth = config.max_concurrent_io
         self._os_disk_bs = 0
         if self._use_odirect:
             stat = os.statvfs(self._base_path)
@@ -365,12 +386,14 @@ class FSL2Adapter(L2AdapterInterface):
         logger.info(
             "Initialized FSL2Adapter with base_path=%s, "
             "relative_tmp_dir=%s, "
-            "read_ahead_size=%s, use_odirect=%s, max_capacity_gb=%s",
+            "read_ahead_size=%s, use_odirect=%s, max_capacity_gb=%s, "
+            "max_concurrent_io=%d",
             self._base_path,
             self._relative_tmp_dir,
             self._read_ahead_size,
             self._use_odirect,
             capacity_gb,
+            self._io_depth,
         )
 
     # ------------------------------------------------------------------
@@ -803,8 +826,11 @@ class FSL2Adapter(L2AdapterInterface):
     ) -> None:
         bitmap = Bitmap(len(keys))
         found: list[ObjectKey] = []
-        for i, key in enumerate(keys):
-            if not await self._key_exists_on_disk(key):
+        exists = await self._bounded_gather(
+            [self._key_exists_on_disk(key) for key in keys]
+        )
+        for i, (key, present) in enumerate(zip(keys, exists, strict=True)):
+            if not present:
                 continue
             bitmap.set(i)
             found.append(key)
@@ -818,6 +844,19 @@ class FSL2Adapter(L2AdapterInterface):
 
     # ---- load -----------------------------------------------------------
 
+    async def _bounded_gather(self, coros: list) -> list:
+        """Await ``coros`` with at most ``max_concurrent_io`` in flight;
+        results come back in order. With a depth of 1, one at a time."""
+        if self._io_depth <= 1:
+            return [await coro for coro in coros]
+        semaphore = asyncio.Semaphore(self._io_depth)
+
+        async def bounded(coro):
+            async with semaphore:
+                return await coro
+
+        return await asyncio.gather(*(bounded(coro) for coro in coros))
+
     async def _execute_load(
         self,
         keys: list[ObjectKey],
@@ -825,79 +864,12 @@ class FSL2Adapter(L2AdapterInterface):
         task_id: L2TaskId,
     ) -> None:
         bitmap = Bitmap(len(keys))
-        for i, key in enumerate(keys):
-            file_path = self._key_to_path(key)
-            try:
-                dst_buf = objects[i].byte_array
-                expected = len(dst_buf)
-                num_read: Optional[int] = None
-
-                # O_DIRECT path (sync, via executor)
-                if self._use_odirect:
-                    num_read = await self._loop.run_in_executor(
-                        None,
-                        self._read_with_odirect,
-                        file_path,
-                        dst_buf,
-                    )
-                    if num_read != expected:
-                        logger.warning(
-                            "Incomplete O_DIRECT read for %s: expected %d, got %d",
-                            file_path.name,
-                            expected,
-                            num_read or 0,
-                        )
-                    else:
-                        bitmap.set(i)
-                        logger.debug(
-                            "FSL2Adapter loaded key %s (%d bytes, O_DIRECT)",
-                            file_path.name,
-                            num_read,
-                        )
-                    continue
-
-                # Standard async path with optional
-                # read-ahead
-                expected = len(dst_buf)
-                async with aiofiles.open(file_path, "rb") as f:
-                    if self._read_ahead_size is None:
-                        num_read = await _async_readinto_full(f, dst_buf)
-                    else:
-                        if not isinstance(dst_buf, memoryview):
-                            dst_buf = memoryview(dst_buf)
-                        # Trigger readahead with a
-                        # small initial read
-                        ra = self._read_ahead_size
-                        n_head = await _async_readinto_full(f, dst_buf[:ra])
-                        if n_head == ra:
-                            n_tail = await _async_readinto_full(f, dst_buf[ra:])
-                            num_read = n_head + n_tail
-                        else:
-                            num_read = n_head
-
-                    if num_read != expected:
-                        logger.warning(
-                            "Incomplete read for %s: expected %d, got %d",
-                            file_path.name,
-                            expected,
-                            num_read,
-                        )
-                        continue
-
-                    bitmap.set(i)
-                    logger.debug(
-                        "FSL2Adapter loaded key %s (%d bytes)",
-                        file_path.name,
-                        num_read,
-                    )
-            except FileNotFoundError:
-                continue
-            except Exception:
-                logger.exception(
-                    "FSL2Adapter failed to load %s",
-                    file_path,
-                )
-                continue
+        loaded_ok = await self._bounded_gather(
+            [self._load_one(key, obj) for key, obj in zip(keys, objects, strict=True)]
+        )
+        for i, ok in enumerate(loaded_ok):
+            if ok:
+                bitmap.set(i)
 
         # A load is a use: it moves the key to the young end of the LRU.
         loaded = bitmap.gather(keys)
@@ -907,6 +879,79 @@ class FSL2Adapter(L2AdapterInterface):
         with self._lock:
             self._completed_load_tasks[task_id] = bitmap
         self._load_efd.notify()
+
+    async def _load_one(self, key: ObjectKey, obj: MemoryObj) -> bool:
+        """Read one key's file into ``obj``; True when all of it arrived."""
+        file_path = self._key_to_path(key)
+        try:
+            dst_buf = obj.byte_array
+            expected = len(dst_buf)
+            num_read: Optional[int] = None
+
+            # O_DIRECT path (sync, via executor)
+            if self._use_odirect:
+                num_read = await self._loop.run_in_executor(
+                    None,
+                    self._read_with_odirect,
+                    file_path,
+                    dst_buf,
+                )
+                if num_read != expected:
+                    logger.warning(
+                        "Incomplete O_DIRECT read for %s: expected %d, got %d",
+                        file_path.name,
+                        expected,
+                        num_read or 0,
+                    )
+                    return False
+                logger.debug(
+                    "FSL2Adapter loaded key %s (%d bytes, O_DIRECT)",
+                    file_path.name,
+                    num_read,
+                )
+                return True
+
+            # Standard async path with optional
+            # read-ahead
+            async with aiofiles.open(file_path, "rb") as f:
+                if self._read_ahead_size is None:
+                    num_read = await _async_readinto_full(f, dst_buf)
+                else:
+                    if not isinstance(dst_buf, memoryview):
+                        dst_buf = memoryview(dst_buf)
+                    # Trigger readahead with a
+                    # small initial read
+                    ra = self._read_ahead_size
+                    n_head = await _async_readinto_full(f, dst_buf[:ra])
+                    if n_head == ra:
+                        n_tail = await _async_readinto_full(f, dst_buf[ra:])
+                        num_read = n_head + n_tail
+                    else:
+                        num_read = n_head
+
+                if num_read != expected:
+                    logger.warning(
+                        "Incomplete read for %s: expected %d, got %d",
+                        file_path.name,
+                        expected,
+                        num_read,
+                    )
+                    return False
+
+                logger.debug(
+                    "FSL2Adapter loaded key %s (%d bytes)",
+                    file_path.name,
+                    num_read,
+                )
+                return True
+        except FileNotFoundError:
+            return False
+        except Exception:
+            logger.exception(
+                "FSL2Adapter failed to load %s",
+                file_path,
+            )
+            return False
 
 
 # Self-register config type and adapter factory
