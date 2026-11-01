@@ -126,6 +126,29 @@ async def _async_readinto_full(
     return total
 
 
+# Reading several files at once is this fork's; upstream's FS adapter reads one
+# at a time. A spec's ``max_concurrent_io`` wins; without one, this variable
+# sets it (1 = upstream's behaviour), and without either it is 8.
+MAX_CONCURRENT_IO_ENV_VAR = "LMCACHE_FS_MAX_CONCURRENT_IO"
+
+
+def _default_concurrent_io() -> int:
+    raw = os.getenv(MAX_CONCURRENT_IO_ENV_VAR, "").strip()
+    if not raw:
+        return 8
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"{MAX_CONCURRENT_IO_ENV_VAR}={raw!r} is not a positive integer"
+        ) from None
+    if value < 1:
+        raise ValueError(
+            f"{MAX_CONCURRENT_IO_ENV_VAR}={raw!r} is not a positive integer"
+        )
+    return value
+
+
 def _object_key_to_filename(key: ObjectKey) -> str:
     """Build a reversible, filesystem-safe filename.
 
@@ -269,7 +292,7 @@ class FSL2AdapterConfig(L2AdapterConfigBase):
             or max_capacity_gb <= 0
         ):
             raise ValueError("max_capacity_gb must be a positive number")
-        max_concurrent_io = d.get("max_concurrent_io", 8)
+        max_concurrent_io = d.get("max_concurrent_io", _default_concurrent_io())
         if (
             isinstance(max_concurrent_io, bool)
             or not isinstance(max_concurrent_io, int)
@@ -304,7 +327,8 @@ class FSL2AdapterConfig(L2AdapterConfigBase):
             "(optional, default unbounded)\n"
             "- max_concurrent_io (int): files one load reads at "
             "once, and existence checks one lookup runs at once "
-            "(optional, default 8; 1 = one at a time)"
+            "(optional, default $LMCACHE_FS_MAX_CONCURRENT_IO or 8; "
+            "1 = one at a time)"
         )
 
 

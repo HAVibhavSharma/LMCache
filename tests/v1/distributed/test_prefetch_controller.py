@@ -1306,3 +1306,22 @@ class TestL1HeldBlocks:
         l1_manager.finish_read(keys)
         ctrl.stop()
         adapter.close()
+
+    def test_join_off_a_block_being_written_is_a_miss(self, l1_manager, monkeypatch):
+        """LMCACHE_PREFETCH_JOIN_IN_FLIGHT=0, upstream's behaviour: a block
+        another writer holds ends the prefix instead of being waited for."""
+        monkeypatch.setenv("LMCACHE_PREFETCH_JOIN_IN_FLIGHT", "0")
+        adapter = make_adapter()
+        layout = make_layout()
+        keys = [make_object_key(i) for i in range(5)]
+        store_keys_in_l2(adapter, keys, layout)
+        put_in_l1(l1_manager, keys[2:3], layout, finish=False)
+
+        ctrl = self._controller(l1_manager, adapter)
+        req_id = ctrl.submit_prefetch_request(keys, layout)
+        assert wait_for_prefetch_result(ctrl, req_id) == 2
+
+        l1_manager.finish_read(keys[:2])
+        l1_manager.finish_write(keys[2:3])
+        ctrl.stop()
+        adapter.close()

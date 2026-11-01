@@ -20,6 +20,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Iterable
 import enum
+import os
 import select
 import threading
 import time
@@ -141,6 +142,22 @@ JOIN_POLL_TIMEOUT_MS = 10
 # How long a request waits on such blocks before counting them as misses (s).
 JOIN_TIMEOUT_S = 30.0
 
+# Joining is this fork's, not upstream LMCache's: there a block another
+# writer holds is a contended reservation and the request goes without it.
+# "0" restores that. Read once, when the controller is built.
+JOIN_IN_FLIGHT_ENV_VAR = "LMCACHE_PREFETCH_JOIN_IN_FLIGHT"
+
+
+def _join_in_flight_enabled() -> bool:
+    """Whether to wait on blocks being written (on unless set to 0/false/no/off)."""
+    return os.getenv(JOIN_IN_FLIGHT_ENV_VAR, "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
 PrefetchRequestId = int
 
 
@@ -238,6 +255,12 @@ class PrefetchController(StorageControllerInterface):
         self._adapter_descriptors = adapter_descriptors
         self._policy = policy
         self._max_in_flight = max_in_flight
+        self._join_in_flight = _join_in_flight_enabled()
+        logger.info(
+            "PrefetchController: blocks still being written into L1 are %s (%s)",
+            "waited for" if self._join_in_flight else "misses",
+            JOIN_IN_FLIGHT_ENV_VAR,
+        )
 
         # In-flight request tracking (background thread only)
         self._in_flight_requests: dict[PrefetchRequestId, InFlightPrefetchRequest] = {}
@@ -695,7 +718,7 @@ class PrefetchController(StorageControllerInterface):
                 request.write_reserved_objs[key] = mem_obj
                 reserved.set(i)
                 continue
-            if err == L1Error.KEY_NOT_WRITABLE:
+            if err == L1Error.KEY_NOT_WRITABLE and self._join_in_flight:
                 request.pending_joins[i] = key
                 continue
             if err == L1Error.OUT_OF_MEMORY:
@@ -827,7 +850,7 @@ class PrefetchController(StorageControllerInterface):
             if err == L1Error.SUCCESS:
                 request.claimed_indices.add(i)
                 held.set(i)
-            elif err == L1Error.KEY_NOT_READABLE:
+            elif err == L1Error.KEY_NOT_READABLE and self._join_in_flight:
                 request.pending_joins[i] = key
                 held.set(i)
         request.join_deadline = time.monotonic() + JOIN_TIMEOUT_S

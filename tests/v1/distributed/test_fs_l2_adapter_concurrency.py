@@ -90,6 +90,14 @@ class TestConfig:
         cfg = FSL2AdapterConfig.from_dict({"type": "fs", "base_path": str(tmp_path)})
         assert cfg.max_concurrent_io == 8
 
+    def test_the_env_sets_the_default(self, tmp_path, monkeypatch):
+        # 1 is upstream's one file at a time; a spec value still wins.
+        monkeypatch.setenv("LMCACHE_FS_MAX_CONCURRENT_IO", "1")
+        spec = {"type": "fs", "base_path": str(tmp_path)}
+        assert FSL2AdapterConfig.from_dict(spec).max_concurrent_io == 1
+        spec["max_concurrent_io"] = 4
+        assert FSL2AdapterConfig.from_dict(spec).max_concurrent_io == 4
+
     @pytest.mark.parametrize("bad", [0, -2, "8", True, 1.5])
     def test_a_bad_depth_is_rejected(self, tmp_path, bad):
         with pytest.raises(ValueError):
