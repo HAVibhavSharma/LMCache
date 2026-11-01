@@ -1142,3 +1142,158 @@ class TestQueryLookupResult:
         assert ctrl.query_lookup_result(999) is None
 
         ctrl.stop()
+
+
+# =============================================================================
+# Blocks L1 already holds, or is still being written
+# =============================================================================
+
+
+def put_in_l1(
+    l1_manager: L1Manager,
+    keys: list[ObjectKey],
+    layout: MemoryLayoutDesc,
+    finish: bool = True,
+) -> None:
+    """Put keys straight into L1; with finish=False they stay write-locked,
+    as while another prefetch or a store is still writing them."""
+    ret = l1_manager.reserve_write(
+        keys, is_temporary=[False] * len(keys), layout_desc=layout, mode="new"
+    )
+    for key in keys:
+        assert ret[key][0] == L1Error.SUCCESS
+    if finish:
+        l1_manager.finish_write(keys)
+
+
+class TestL1HeldBlocks:
+    """A block L1 already holds counts toward the prefix and is read-locked
+    instead of loaded; a block still being written is waited for."""
+
+    def _controller(self, l1_manager, adapter):
+        ctrl = PrefetchController(
+            l1_manager=l1_manager,
+            l2_adapters=[adapter],
+            adapter_descriptors=[make_descriptor(0)],
+            policy=DefaultPrefetchPolicy(),
+        )
+        ctrl.start()
+        return ctrl
+
+    def test_blocks_in_l1_extend_the_prefix(self, l1_manager):
+        """L2 has {0, 1}, L1 has {2, 3, 4} -> 5 hits, each read-locked once.
+
+        Before, the prefix stopped at 2: the L1 copy could not be
+        write-reserved, so it counted as a miss."""
+        adapter = make_adapter()
+        layout = make_layout()
+        keys = [make_object_key(i) for i in range(5)]
+        store_keys_in_l2(adapter, keys[:2], layout)
+        put_in_l1(l1_manager, keys[2:], layout)
+
+        ctrl = self._controller(l1_manager, adapter)
+        req_id = ctrl.submit_prefetch_request(keys, layout)
+        result = wait_for_prefetch_result(ctrl, req_id)
+        assert result == 5
+
+        for key in keys:
+            assert l1_manager.unsafe_read([key])[key][0] == L1Error.SUCCESS
+        finished = l1_manager.finish_read(keys)
+        assert all(finished[key] == L1Error.SUCCESS for key in keys)
+        # Exactly one lock each: a second release finds the L1 copies unlocked.
+        again = l1_manager.finish_read(keys[2:])
+        assert all(again[key] == L1Error.KEY_IN_WRONG_STATE for key in keys[2:])
+
+        ctrl.stop()
+        adapter.close()
+
+    def test_l1_blocks_past_the_prefix_are_not_left_locked(self, l1_manager):
+        """L2 has {0}, L1 has {2, 3}; key 1 is nowhere -> 1 hit, and the
+        L1 copies of 2 and 3 end with no read lock."""
+        adapter = make_adapter()
+        layout = make_layout()
+        keys = [make_object_key(i) for i in range(4)]
+        store_keys_in_l2(adapter, keys[:1], layout)
+        put_in_l1(l1_manager, keys[2:], layout)
+
+        ctrl = self._controller(l1_manager, adapter)
+        req_id = ctrl.submit_prefetch_request(keys, layout)
+        result = wait_for_prefetch_result(ctrl, req_id)
+        assert result == 1
+
+        again = l1_manager.finish_read(keys[2:])
+        assert all(again[key] == L1Error.KEY_IN_WRONG_STATE for key in keys[2:])
+        l1_manager.finish_read(keys[:1])
+        ctrl.stop()
+        adapter.close()
+
+    def test_waits_for_a_block_still_being_written(self, l1_manager):
+        """Key 2 is write-locked in L1 (a load or store in progress): the
+        request waits for it, then reports all 5 instead of 2."""
+        adapter = make_adapter()
+        layout = make_layout()
+        keys = [make_object_key(i) for i in range(5)]
+        store_keys_in_l2(adapter, keys, layout)
+        put_in_l1(l1_manager, keys[2:3], layout, finish=False)
+
+        ctrl = self._controller(l1_manager, adapter)
+        req_id = ctrl.submit_prefetch_request(keys, layout)
+        time.sleep(0.3)
+        assert ctrl.query_prefetch_result(req_id) is None
+
+        l1_manager.finish_write(keys[2:3])
+        assert wait_for_prefetch_result(ctrl, req_id) == 5
+
+        l1_manager.finish_read(keys)
+        ctrl.stop()
+        adapter.close()
+
+    def test_gives_up_on_a_write_that_never_finishes(self, l1_manager, monkeypatch):
+        # First Party
+        from lmcache.v1.distributed.storage_controllers import prefetch_controller
+
+        monkeypatch.setattr(prefetch_controller, "JOIN_TIMEOUT_S", 0.2)
+        adapter = make_adapter()
+        layout = make_layout()
+        keys = [make_object_key(i) for i in range(5)]
+        store_keys_in_l2(adapter, keys, layout)
+        put_in_l1(l1_manager, keys[2:3], layout, finish=False)
+
+        ctrl = self._controller(l1_manager, adapter)
+        req_id = ctrl.submit_prefetch_request(keys, layout)
+        assert wait_for_prefetch_result(ctrl, req_id) == 2
+
+        l1_manager.finish_read(keys[:2])
+        l1_manager.finish_write(keys[2:3])
+        ctrl.stop()
+        adapter.close()
+
+    def test_two_requests_for_the_same_blocks_share_one_load(self, l1_manager):
+        """B arrives while A is still loading: B waits for A's load instead
+        of reporting a miss. Each key ends with one read lock per request."""
+        # ~200 KB per key at 1 MB/s: the load takes ~0.6 s.
+        adapter = MockL2Adapter(
+            MockL2AdapterConfig(max_size_gb=0.01, mock_bandwidth_gb=0.001)
+        )
+        layout = make_layout()
+        keys = [make_object_key(i) for i in range(3)]
+        store_keys_in_l2(adapter, keys, layout)
+
+        ctrl = self._controller(l1_manager, adapter)
+        req_a = ctrl.submit_prefetch_request(keys, layout)
+        assert wait_for_condition(
+            lambda: l1_manager.get_object_state(keys[0]) is not None
+        ), "A never started loading"
+        req_b = ctrl.submit_prefetch_request(keys, layout)
+
+        assert wait_for_prefetch_result(ctrl, req_a, timeout=10.0) == 3
+        assert wait_for_prefetch_result(ctrl, req_b, timeout=10.0) == 3
+
+        first = l1_manager.finish_read(keys)
+        assert all(first[key] == L1Error.SUCCESS for key in keys)
+        assert all(
+            l1_manager.unsafe_read([key])[key][0] == L1Error.SUCCESS for key in keys
+        ), "B's read lock should still hold"
+        l1_manager.finish_read(keys)
+        ctrl.stop()
+        adapter.close()
