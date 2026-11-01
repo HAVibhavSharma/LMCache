@@ -14,6 +14,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Union
 import asyncio
+import mmap
 import os
 import threading
 
@@ -25,6 +26,7 @@ if TYPE_CHECKING:
 # Third Party
 import aiofiles
 import aiofiles.os
+import numpy as np
 
 # First Party
 from lmcache.logging import init_logger
@@ -77,6 +79,36 @@ def _readinto_full(
             break
         total += n
     return total
+
+
+def _is_aligned(buf: Union[bytearray, memoryview, bytes, mmap.mmap]) -> bool:
+    """Whether *buf*'s memory starts on a page, as O_DIRECT needs.
+
+    O_DIRECT checks the address of the buffer it reads into or writes from,
+    not only the length and the file offset. An L1 object's ``byte_array`` is
+    a view into one large pool at no such boundary, and writing straight from
+    it failed every time with EINVAL (Errno 22).
+    """
+    try:
+        address = np.frombuffer(buf, dtype=np.uint8).__array_interface__["data"][0]
+    except (TypeError, ValueError):
+        return False
+    return address % mmap.PAGESIZE == 0
+
+
+def _page_aligned(size: int) -> mmap.mmap:
+    """*size* bytes of anonymous memory, which the kernel maps from a page."""
+    return mmap.mmap(-1, size)
+
+
+def _close_quietly(bounce: Optional[mmap.mmap]) -> None:
+    """Unmap a bounce buffer; a view still held only delays it to the GC."""
+    if bounce is None:
+        return
+    try:
+        bounce.close()
+    except BufferError:
+        pass
 
 
 async def _async_readinto_full(
@@ -585,9 +617,14 @@ class FSL2Adapter(L2AdapterInterface):
 
         Returns the number of bytes actually read.
         Runs in an executor (not on the event loop).
+
+        A *dst_buf* that does not start on a page is read through a
+        page-aligned buffer and copied in: O_DIRECT rejects the read
+        otherwise (see :func:`_is_aligned`).
         """
         fd = -1
         size = len(dst_buf)
+        bounce: Optional[mmap.mmap] = None
         try:
             aligned = self._os_disk_bs > 0 and size % self._os_disk_bs == 0
             if not aligned:
@@ -598,13 +635,23 @@ class FSL2Adapter(L2AdapterInterface):
                 with open(file_path, "rb") as f:
                     return _readinto_full(f, dst_buf)
 
+            target: Union[bytearray, memoryview, bytes, mmap.mmap] = dst_buf
+            if not _is_aligned(dst_buf):
+                with memoryview(dst_buf) as view:
+                    bounce = target = _page_aligned(view.nbytes)
             fd = os.open(
                 str(file_path),
                 os.O_RDONLY | getattr(os, "O_DIRECT", 0),
             )
             with os.fdopen(fd, "rb", buffering=0) as fdo:
                 fd = -1  # now managed by fdopen
-                return _readinto_full(fdo, dst_buf)
+                num_read = _readinto_full(fdo, target)
+            if bounce is not None:
+                with memoryview(bounce) as src, memoryview(dst_buf) as dst:
+                    flat = dst.cast("B")
+                    flat[:num_read] = src[:num_read]
+                    flat.release()
+            return num_read
         except Exception:
             logger.exception("Failed to O_DIRECT read %s", file_path)
             return 0
@@ -614,20 +661,38 @@ class FSL2Adapter(L2AdapterInterface):
                     os.close(fd)
                 except OSError:
                     pass
+            _close_quietly(bounce)
 
     def _write_with_odirect(self, file_path: Path, buf: bytes) -> None:
         """Synchronous O_DIRECT write of *buf*.
 
         Runs in an executor (not on the event loop).
+
+        A *buf* that does not start on a page is copied to a page-aligned
+        buffer and written from there: O_DIRECT rejects the write otherwise
+        (see :func:`_is_aligned`).
         """
         fd = -1
+        bounce: Optional[mmap.mmap] = None
         try:
+            with memoryview(buf) as view:
+                nbytes = view.nbytes
+            data: Union[bytes, memoryview, mmap.mmap] = buf
+            if not _is_aligned(buf):
+                bounce = _page_aligned(nbytes)
+                with memoryview(bounce) as dst, memoryview(buf) as src:
+                    flat = src.cast("B")
+                    dst[:] = flat
+                    flat.release()
+                data = bounce
             fd = os.open(
                 str(file_path),
                 os.O_CREAT | os.O_WRONLY | getattr(os, "O_DIRECT", 0),
                 0o644,
             )
-            os.write(fd, buf)
+            written = os.write(fd, data)
+            if written != nbytes:
+                raise OSError(f"short O_DIRECT write: {written} of {nbytes} bytes")
         except Exception:
             logger.exception("Failed to O_DIRECT write %s", file_path)
             raise
@@ -637,6 +702,7 @@ class FSL2Adapter(L2AdapterInterface):
                     os.close(fd)
                 except OSError:
                     pass
+            _close_quietly(bounce)
 
     # ---- store ----------------------------------------------------------
 
