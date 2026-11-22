@@ -30,6 +30,7 @@ from collections.abc import Callable
 from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.distributed.eviction_policy.lru import LRUEvictionPolicy
 from lmcache.v1.distributed.internal_api import EvictionAction
+from lmcache.v1.distributed.warm_session import WARM_SESSION_PREFIX, warm_session_id
 
 # Tags kept per block. A block of a shared prefix is tagged by every job that
 # warms it; past this many the oldest tag goes, which only ever lowers demand.
@@ -40,12 +41,15 @@ def parse_warm_session(session_id: str) -> tuple[str, str] | None:
     """``(job, node)`` from a warm's session id, or None.
 
     ``prefetch::langgraph:9:swe_architect:check_research_step::2df9...::l1-b1c5``
-    gives ``("9", "check_research_step")``. A warm with no single job -- the
-    population phase's ``langgraph:*:**:<node>`` -- names nobody and is None.
+    gives ``("9", "check_research_step")``, and so does a prompt seed's
+    ``chatcmpl-prefetch::langgraph:9:swe_architect:check_research_step::seed-...``.
+    A warm with no single job -- the population phase's
+    ``langgraph:*:**:<node>`` -- names nobody and is None.
     """
-    if not session_id.startswith("prefetch::"):
+    warm = warm_session_id(session_id)
+    if warm is None:
         return None
-    agent = session_id[len("prefetch::") :].split("::", 1)[0]
+    agent = warm[len(WARM_SESSION_PREFIX) :].split("::", 1)[0]
     parts = agent.split(":")
     if len(parts) < 3:
         return None

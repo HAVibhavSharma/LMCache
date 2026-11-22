@@ -39,6 +39,13 @@ from lmcache.v1.distributed.storage_controllers.prefetch_policy import (
 from lmcache.v1.distributed.storage_controllers.store_policy import (
     AdapterDescriptor,
 )
+
+# A warm: vLLM's phantom prefetch, or a prompt seed named as one
+# (``warm_session``). Re-exported, as callers import it from here.
+from lmcache.v1.distributed.warm_session import (  # noqa: F401
+    WARM_SESSION_PREFIX,
+    is_warm_session,
+)
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import get_event_bus
@@ -151,8 +158,6 @@ JOIN_IN_FLIGHT_ENV_VAR = "LMCACHE_PREFETCH_JOIN_IN_FLIGHT"
 REAL_FIRST_ENV_VAR = "LMCACHE_PREFETCH_REAL_FIRST"
 WARM_MAX_IN_FLIGHT_ENV_VAR = "LMCACHE_PREFETCH_WARM_MAX_IN_FLIGHT"
 RETAIN_WARMS_ENV_VAR = "LMCACHE_PREFETCH_RETAIN_WARMS"
-# A warm is vLLM's phantom prefetch: its request id (the session) starts so.
-WARM_SESSION_PREFIX = "prefetch::"
 
 
 def _flag(name: str) -> bool:
@@ -164,12 +169,6 @@ def _warm_max_in_flight() -> int:
         return max(1, int(os.getenv(WARM_MAX_IN_FLIGHT_ENV_VAR, "1")))
     except ValueError:
         return 1
-
-
-def is_warm_session(request_id: str) -> bool:
-    """Whether an LMCache request comes from a vLLM warm (a phantom), not a
-    real request: phantom ids are ``prefetch::<agent>::<hash>[::l1]``."""
-    return request_id.startswith(WARM_SESSION_PREFIX)
 
 
 def _join_in_flight_enabled() -> bool:

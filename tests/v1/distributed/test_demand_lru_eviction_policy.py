@@ -35,6 +35,9 @@ def evicted(policy, n, total):
         # the population phase's warms name no single job
         ("prefetch::langgraph:*:**:conduct_research::81531b9e19610bce", None),
         ("chatcmpl-a984d0682eeb8b21", None),
+        # a prompt seed on the prefill engine, named as a warm
+        ("chatcmpl-prefetch::langgraph:4:swe_architect:conduct_research::seed-1f2e3d-9a8b7c6d",
+         ("4", "conduct_research")),
         ("prefetch::short", None),
     ],
 )
