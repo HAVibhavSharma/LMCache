@@ -106,6 +106,26 @@ class L1EvictionController(EvictionController):
         self._l1_manager.register_listener(self._listener)
         self._event_bus = get_event_bus()
 
+    # Demand-aware eviction (``DemandLRU``): no-ops under any other policy.
+    def tag_warm_keys(self, keys: list[ObjectKey], session_id: str) -> None:
+        tag = getattr(self._eviction_policy, "tag_keys_for_session", None)
+        if tag is not None:
+            tag(keys, session_id)
+
+    def set_demand(self, job_id: str, nodes: dict[str, float]) -> bool:
+        setter = getattr(self._eviction_policy, "set_demand", None)
+        if setter is None:
+            return False
+        setter(job_id, nodes)
+        return True
+
+    def clear_demand(self, job_id: str) -> bool:
+        clear = getattr(self._eviction_policy, "clear_demand", None)
+        if clear is None:
+            return False
+        clear(job_id)
+        return True
+
     def report_status(self) -> dict:
         return {
             "is_healthy": self._thread.is_alive(),

@@ -30,6 +30,9 @@ from lmcache.v1.distributed.storage_controllers import (
     PrefetchController,
     StoreController,
 )
+from lmcache.v1.distributed.storage_controllers.prefetch_controller import (
+    is_warm_session,
+)
 from lmcache.v1.distributed.storage_controllers.prefetch_policy import (
     create_prefetch_policy,
 )
@@ -439,7 +442,12 @@ class StorageManager:
                 remaining_keys,
                 layout_desc,
                 extra_count=extra_count,
+                warm=is_warm_session(external_request_id),
             )
+        if is_warm_session(external_request_id):
+            # Every block of the warm's prompt, whether L1 held it or not: the
+            # demand policy keeps what a predicted call will read.
+            self._eviction_controller.tag_warm_keys(keys, external_request_id)
 
         submit_time = time.monotonic()
         logger.debug(
@@ -609,6 +617,15 @@ class StorageManager:
             adapter.close()
 
         self._l1_manager.close()
+
+    def set_demand(self, job_id: str, nodes: dict[str, float]) -> bool:
+        """A running question's predicted next nodes and their weights, for
+        a demand-aware L1 eviction policy. False when the policy is not one."""
+        return self._eviction_controller.set_demand(job_id, nodes)
+
+    def clear_demand(self, job_id: str) -> bool:
+        """The question ended: its predictions protect nothing any more."""
+        return self._eviction_controller.clear_demand(job_id)
 
     def report_status(self) -> dict:
         """Return a status dict aggregating all sub-component statuses."""

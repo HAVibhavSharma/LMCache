@@ -497,16 +497,23 @@ class FSL2Adapter(L2AdapterInterface):
     # Load Interface
     # ------------------------------------------------------------------
 
+    # Read by PrefetchController: a warm's load may be submitted low priority.
+    supports_load_priority = True
+
     def submit_load_task(
         self,
         keys: list[ObjectKey],
         objects: list[MemoryObj],
+        low_priority: bool = False,
     ) -> L2TaskId:
+        """``low_priority``: a warm's load (LMCACHE_PREFETCH_REAL_FIRST). Each
+        of its file reads waits while any other load is running, so a real
+        request's read never queues behind a warm's for the disk."""
         with self._lock:
             task_id = self._get_next_task_id()
 
         asyncio.run_coroutine_threadsafe(
-            self._execute_load(keys, objects, task_id),
+            self._execute_load(keys, objects, task_id, low_priority=low_priority),
             self._loop,
         )
         return task_id
@@ -881,16 +888,42 @@ class FSL2Adapter(L2AdapterInterface):
 
         return await asyncio.gather(*(bounded(coro) for coro in coros))
 
+    def _no_real_loads(self) -> asyncio.Event:
+        """Set while no load other than a warm's is running. Event-loop only."""
+        event = getattr(self, "_no_real_loads_event", None)
+        if event is None:
+            event = asyncio.Event()
+            event.set()
+            self._no_real_loads_event = event
+            self._real_loads_running = 0
+        return event
+
+    async def _after_real_loads(self, coro):
+        """Start ``coro`` (a warm's file read) only once no real load runs."""
+        await self._no_real_loads().wait()
+        return await coro
+
     async def _execute_load(
         self,
         keys: list[ObjectKey],
         objects: list[MemoryObj],
         task_id: L2TaskId,
+        low_priority: bool = False,
     ) -> None:
         bitmap = Bitmap(len(keys))
-        loaded_ok = await self._bounded_gather(
-            [self._load_one(key, obj) for key, obj in zip(keys, objects, strict=True)]
-        )
+        gate = self._no_real_loads()
+        reads = [self._load_one(key, obj) for key, obj in zip(keys, objects, strict=True)]
+        if low_priority:
+            loaded_ok = await self._bounded_gather([self._after_real_loads(r) for r in reads])
+        else:
+            self._real_loads_running += 1
+            gate.clear()
+            try:
+                loaded_ok = await self._bounded_gather(reads)
+            finally:
+                self._real_loads_running -= 1
+                if self._real_loads_running == 0:
+                    gate.set()
         for i, ok in enumerate(loaded_ok):
             if ok:
                 bitmap.set(i)

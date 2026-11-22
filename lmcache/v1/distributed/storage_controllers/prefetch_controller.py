@@ -148,6 +148,30 @@ JOIN_TIMEOUT_S = 30.0
 JOIN_IN_FLIGHT_ENV_VAR = "LMCACHE_PREFETCH_JOIN_IN_FLIGHT"
 
 
+REAL_FIRST_ENV_VAR = "LMCACHE_PREFETCH_REAL_FIRST"
+WARM_MAX_IN_FLIGHT_ENV_VAR = "LMCACHE_PREFETCH_WARM_MAX_IN_FLIGHT"
+RETAIN_WARMS_ENV_VAR = "LMCACHE_PREFETCH_RETAIN_WARMS"
+# A warm is vLLM's phantom prefetch: its request id (the session) starts so.
+WARM_SESSION_PREFIX = "prefetch::"
+
+
+def _flag(name: str) -> bool:
+    return os.getenv(name, "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _warm_max_in_flight() -> int:
+    try:
+        return max(1, int(os.getenv(WARM_MAX_IN_FLIGHT_ENV_VAR, "1")))
+    except ValueError:
+        return 1
+
+
+def is_warm_session(request_id: str) -> bool:
+    """Whether an LMCache request comes from a vLLM warm (a phantom), not a
+    real request: phantom ids are ``prefetch::<agent>::<hash>[::l1]``."""
+    return request_id.startswith(WARM_SESSION_PREFIX)
+
+
 def _join_in_flight_enabled() -> bool:
     """Whether to wait on blocks being written (on unless set to 0/false/no/off)."""
     return os.getenv(JOIN_IN_FLIGHT_ENV_VAR, "1").strip().lower() not in (
@@ -175,6 +199,13 @@ class InFlightPrefetchRequest:
     layout_desc: MemoryLayoutDesc
     phase: PrefetchPhase
     extra_count: int = 0
+    warm: bool = False
+    """Submitted for a vLLM warm (``is_warm_session``), not a real request."""
+    low_priority: bool = False
+    """A warm's prefetch (``is_warm_session``) under LMCACHE_PREFETCH_REAL_FIRST:
+    started only when no real request's prefetch waits, at most
+    LMCACHE_PREFETCH_WARM_MAX_IN_FLIGHT at once, and its disk reads yield to
+    real ones in an adapter that supports it."""
     """Extra read locks per key (on top of the default 1) to acquire when
     transitioning from write-locked to read-locked.  Must match the
     ``extra_count`` used in the corresponding ``submit_prefetch_task`` call."""
@@ -261,11 +292,34 @@ class PrefetchController(StorageControllerInterface):
             "waited for" if self._join_in_flight else "misses",
             JOIN_IN_FLIGHT_ENV_VAR,
         )
+        # Real requests first: a warm's prefetch queues behind every real
+        # request's, and only a few warms load at once, so a warm read never
+        # stands in front of the read of a call that is waiting for it.
+        self._real_first = _flag(REAL_FIRST_ENV_VAR)
+        self._warm_max_in_flight = _warm_max_in_flight()
+        # A block a warm read from L2 stays in L1 for the LRU to judge,
+        # instead of being deleted as soon as its last reader is done: the
+        # warm was sent because a call is about to need it, and when that
+        # call -- or another question's -- comes after the warm let go, it
+        # still finds it.
+        self._retain_warms = _flag(RETAIN_WARMS_ENV_VAR)
+        logger.info(
+            "PrefetchController: real requests first %s (%s), at most %d warm "
+            "load(s) at once; blocks warms read from L2 %s (%s)",
+            "on" if self._real_first else "off",
+            REAL_FIRST_ENV_VAR,
+            self._warm_max_in_flight,
+            "retained" if self._retain_warms else "per the prefetch policy",
+            RETAIN_WARMS_ENV_VAR,
+        )
+        self._pending_low: list[
+            tuple[PrefetchRequestId, list[ObjectKey], MemoryLayoutDesc, int, bool]
+        ] = []
 
         # In-flight request tracking (background thread only)
         self._in_flight_requests: dict[PrefetchRequestId, InFlightPrefetchRequest] = {}
         self._pending_queue: list[
-            tuple[PrefetchRequestId, list[ObjectKey], MemoryLayoutDesc, int]
+            tuple[PrefetchRequestId, list[ObjectKey], MemoryLayoutDesc, int, bool]
         ] = []
 
         # Shadow counters for status reporting (updated in background loop)
@@ -277,7 +331,7 @@ class PrefetchController(StorageControllerInterface):
         # Thread-safe submission queue (external -> background)
         self._submission_lock = threading.Lock()
         self._submission_queue: list[
-            tuple[PrefetchRequestId, list[ObjectKey], MemoryLayoutDesc, int]
+            tuple[PrefetchRequestId, list[ObjectKey], MemoryLayoutDesc, int, bool]
         ] = []
         self._next_request_id: PrefetchRequestId = 0
         self._submission_efd = create_event_notifier()
@@ -341,6 +395,7 @@ class PrefetchController(StorageControllerInterface):
         keys: list[ObjectKey],
         layout_desc: MemoryLayoutDesc,
         extra_count: int = 0,
+        warm: bool = False,
     ) -> PrefetchRequestId:
         """
         Submit a prefetch request for the given keys.
@@ -377,7 +432,9 @@ class PrefetchController(StorageControllerInterface):
         with self._submission_lock:
             request_id = self._next_request_id
             self._next_request_id += 1
-            self._submission_queue.append((request_id, keys, layout_desc, extra_count))
+            self._submission_queue.append(
+                (request_id, keys, layout_desc, extra_count, warm)
+            )
         self._submission_efd.notify()
         return request_id
 
@@ -607,17 +664,39 @@ class PrefetchController(StorageControllerInterface):
         with self._submission_lock:
             items = self._submission_queue
             self._submission_queue = []
-        self._pending_queue.extend(items)
+        for item in items:
+            if self._real_first and item[4]:
+                self._pending_low.append(item)
+            else:
+                self._pending_queue.append(item)
         self._status_pending_count += len(items)
 
     def _start_pending_requests(self) -> None:
-        """Start pending requests up to the max in-flight limit."""
+        """Start pending requests up to the max in-flight limit.
+
+        Real requests' first, in arrival order. A warm's starts only when no
+        real one is waiting and fewer than the warm cap are in flight.
+        """
         while (
             self._pending_queue and len(self._in_flight_requests) < self._max_in_flight
         ):
-            request_id, keys, layout_desc, extra_count = self._pending_queue.pop(0)
+            request_id, keys, layout_desc, extra_count, warm = self._pending_queue.pop(0)
             self._status_pending_count -= 1
-            self._start_lookup_phase(request_id, keys, layout_desc, extra_count)
+            self._start_lookup_phase(request_id, keys, layout_desc, extra_count,
+                                     warm=warm)
+        while (
+            self._pending_low
+            and not self._pending_queue
+            and len(self._in_flight_requests) < self._max_in_flight
+            and self._warms_in_flight() < self._warm_max_in_flight
+        ):
+            request_id, keys, layout_desc, extra_count, _ = self._pending_low.pop(0)
+            self._status_pending_count -= 1
+            self._start_lookup_phase(request_id, keys, layout_desc, extra_count,
+                                     warm=True)
+
+    def _warms_in_flight(self) -> int:
+        return sum(1 for r in self._in_flight_requests.values() if r.low_priority)
 
     # =========================================================================
     # Lookup phase
@@ -629,6 +708,7 @@ class PrefetchController(StorageControllerInterface):
         keys: list[ObjectKey],
         layout_desc: MemoryLayoutDesc,
         extra_count: int = 0,
+        warm: bool = False,
     ) -> None:
         """Submit lookup_and_lock to all adapters for a new request."""
         if not self._l2_adapters:
@@ -646,6 +726,8 @@ class PrefetchController(StorageControllerInterface):
             layout_desc=layout_desc,
             phase=PrefetchPhase.LOOKUP,
             extra_count=extra_count,
+            warm=warm,
+            low_priority=warm and self._real_first,
             pending_lookup_tasks=pending_lookup_tasks,
         )
         self._in_flight_requests[request_id] = request
@@ -698,7 +780,10 @@ class PrefetchController(StorageControllerInterface):
         to_load = in_l2 & (~held) & prefix_mask
         load_indices = to_load.get_indices_list()
         keys_to_reserve = [request.keys[i] for i in load_indices]
-        retentions = self._policy.select_l1_retentions(keys_to_reserve)
+        if self._retain_warms and request.warm:
+            retentions = [True] * len(keys_to_reserve)
+        else:
+            retentions = self._policy.select_l1_retentions(keys_to_reserve)
         write_results = l1_mgr.reserve_write(
             keys=keys_to_reserve,
             is_temporary=[not r for r in retentions],
@@ -768,9 +853,13 @@ class PrefetchController(StorageControllerInterface):
             per_adapter_objs = [
                 request.write_reserved_objs[key] for key in per_adapter_keys
             ]
-            task_id = self._l2_adapters[adapter_idx].submit_load_task(
-                per_adapter_keys, per_adapter_objs
-            )
+            adapter = self._l2_adapters[adapter_idx]
+            if request.low_priority and getattr(adapter, "supports_load_priority", False):
+                task_id = adapter.submit_load_task(
+                    per_adapter_keys, per_adapter_objs, low_priority=True
+                )
+            else:
+                task_id = adapter.submit_load_task(per_adapter_keys, per_adapter_objs)
             request.pending_load_tasks[adapter_idx] = task_id
             # Per-adapter byte accounting for L2_LOAD_TASK_* throughput
             # events.  Uniform layout per chunk -> size * count.
