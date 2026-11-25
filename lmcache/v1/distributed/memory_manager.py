@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # First Party
+from lmcache.integration.vllm.utils import get_size_bytes
 from lmcache.logging import init_logger
 from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.distributed.config import L1MemoryManagerConfig
@@ -141,6 +142,12 @@ class L1MemoryManager:
         total_size = address_manager.get_heap_size()
         used_size = total_size - free_size
         return used_size, total_size
+
+    def object_size(self, layout_desc: MemoryLayoutDesc) -> int:
+        """Bytes one object of this layout takes, alignment included."""
+        raw = get_size_bytes(layout_desc.shapes, layout_desc.dtypes)
+        align = max(1, self._align_bytes)
+        return (raw + align - 1) // align * align
 
     def get_l1_memory_desc(self) -> L1MemoryDesc:
         """

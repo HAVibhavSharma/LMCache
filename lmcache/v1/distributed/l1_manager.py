@@ -4,8 +4,10 @@ Managing objects and memory for L1 cache
 """
 
 # Standard
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
+import os
 import threading
 
 # First Party
@@ -79,6 +81,30 @@ def l1_mgr_synchronized(func):
 
 
 L1OperationResult = tuple[L1Error, MemoryObj | None]
+
+# Room on demand (fork). Without it, a write reservation that does not fit in
+# the free memory is refused whole: every key gets OUT_OF_MEMORY, and room is
+# made only by the eviction loop, which runs once a second and only above its
+# watermark. A disk read bigger than the free space below the watermark then
+# loads nothing, and vLLM recomputes the prompt. With it, the reservation first
+# evicts just enough unlocked objects (in the eviction policy's order) to fit,
+# and if locked objects still leave too little room, it reserves the leading
+# keys that fit: a load keeps its first blocks, a store its first chunks.
+RECLAIM_ENV_VAR = "LMCACHE_L1_RECLAIM_ON_OOM"
+
+# (objects needed, objects held) -> keys to evict, best candidates first.
+# Called with the L1Manager lock held: it must not call back into L1Manager
+# methods that take the lock (is_key_evictable is fine).
+Reclaimer = Callable[[int, int], list[ObjectKey]]
+
+
+def _reclaim_enabled() -> bool:
+    return os.getenv(RECLAIM_ENV_VAR, "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 # Upper bound for the count parameter in reserve_read / finish_read
 # to prevent a single call from holding the global lock for too long.
@@ -193,6 +219,21 @@ class L1Manager:
 
         self._event_bus = get_event_bus()
 
+        self._reclaim_on_oom = _reclaim_enabled()
+        self._reclaimer: Reclaimer | None = None
+        self._reclaim_stats = {
+            "reservations_short": 0,
+            "objects_evicted": 0,
+            "reservations_partial": 0,
+            "reservations_refused": 0,
+        }
+        if self._reclaim_on_oom:
+            logger.info(
+                "L1Manager: a write reservation that does not fit evicts what "
+                "it needs and keeps the leading keys that fit (%s)",
+                RECLAIM_ENV_VAR,
+            )
+
         L1Manager._gauge_target = self
         if not L1Manager._gauge_registered:
             L1Manager._gauge_registered = True
@@ -221,6 +262,17 @@ class L1Manager:
         """
         with self._lock:
             self._registered_listeners.append(listener)
+
+    def set_reclaimer(self, reclaimer: Reclaimer | None) -> None:
+        """Set who picks the objects to evict when a write reservation does
+        not fit (used only with LMCACHE_L1_RECLAIM_ON_OOM).
+
+        Args:
+            reclaimer: Called with (objects needed, objects held) under the
+                L1Manager lock; returns keys to evict, best first.
+        """
+        with self._lock:
+            self._reclaimer = reclaimer
 
     @l1_mgr_synchronized
     def reserve_read(
@@ -478,9 +530,16 @@ class L1Manager:
                 ret[key] = (L1Error.KEY_NOT_WRITABLE, None)
             return ret
 
-        err, allocated_objs = self._memory_manager.allocate(
-            layout_desc, len(need_to_allocate)
-        )
+        if self._reclaim_on_oom and self._reclaimer is not None:
+            # Room on demand: the leading len(allocated_objs) keys get memory,
+            # the rest OUT_OF_MEMORY.
+            err, allocated_objs = self._allocate_with_reclaim(
+                layout_desc, len(need_to_allocate)
+            )
+        else:
+            err, allocated_objs = self._memory_manager.allocate(
+                layout_desc, len(need_to_allocate)
+            )
 
         if err != L1Error.SUCCESS:
             for key, _ in need_to_allocate:
@@ -503,6 +562,8 @@ class L1Manager:
                 self._objects[key].write_lock.lock()
                 ret[key] = (L1Error.SUCCESS, mem_obj)
                 successful_keys.append(key)
+            for key, _ in need_to_allocate[len(allocated_objs) :]:
+                ret[key] = (L1Error.OUT_OF_MEMORY, None)
 
         for listener in self._registered_listeners:
             listener.on_l1_keys_reserved_write(successful_keys)
@@ -513,6 +574,86 @@ class L1Manager:
             )
         )
         return ret
+
+    def _allocate_with_reclaim(
+        self, layout_desc: MemoryLayoutDesc, count: int
+    ) -> tuple[L1Error, list[MemoryObj]]:
+        """Allocate ``count`` objects, evicting what is needed first; if that
+        still leaves too little room, allocate as many as fit (the caller
+        gives them to its leading keys). Caller holds the lock.
+
+        Returns:
+            (SUCCESS, objects) with 1..count objects, or (OUT_OF_MEMORY, [])
+            when not even one fits.
+        """
+        obj_bytes = max(1, self._memory_manager.object_size(layout_desc))
+
+        def free_objects() -> int:
+            used, total = self._memory_manager.get_memory_usage()
+            return (total - used) // obj_bytes
+
+        short = count - free_objects()
+        if short <= 0:
+            err, objs = self._memory_manager.allocate(layout_desc, count)
+            if err == L1Error.SUCCESS:
+                return err, objs
+            # Enough free bytes, but fragmented: make a little more room.
+            short = max(1, count // 10)
+        self._reclaim_stats["reservations_short"] += 1
+        evicted = self._reclaim(short)
+        self._reclaim_stats["objects_evicted"] += evicted
+
+        # Ask the allocator only for what fits, so a refusal is not logged
+        # as a failed load.
+        fit = min(count, free_objects())
+        if fit == count:
+            err, objs = self._memory_manager.allocate(layout_desc, count)
+            if err == L1Error.SUCCESS:
+                logger.info(
+                    "L1 reclaim: evicted %d objects to reserve %d",
+                    evicted,
+                    count,
+                )
+                return err, objs
+            fit = count * 3 // 4
+
+        # Locked objects hold the rest: keep the leading keys that fit.
+        while fit > 0:
+            err, objs = self._memory_manager.allocate(layout_desc, fit)
+            if err == L1Error.SUCCESS:
+                self._reclaim_stats["reservations_partial"] += 1
+                logger.info(
+                    "L1 reclaim: reserved %d of %d objects (evicted %d; the "
+                    "rest of L1 is locked)",
+                    fit,
+                    count,
+                    evicted,
+                )
+                return err, objs
+            fit = fit * 3 // 4
+        self._reclaim_stats["reservations_refused"] += 1
+        logger.warning(
+            "L1 reclaim: no room for any of %d objects (evicted %d; the rest "
+            "of L1 is locked)",
+            count,
+            evicted,
+        )
+        return L1Error.OUT_OF_MEMORY, []
+
+    def _reclaim(self, count: int) -> int:
+        """Evict up to ``count`` unlocked objects chosen by the reclaimer.
+        Caller holds the lock. Returns the number evicted."""
+        if count <= 0 or self._reclaimer is None or not self._objects:
+            return 0
+        try:
+            keys = self._reclaimer(count, len(self._objects))
+        except Exception:
+            logger.exception("L1 reclaim: the reclaimer failed")
+            return 0
+        if not keys:
+            return 0
+        result = self._delete_unlocked(keys)
+        return sum(1 for e in result.values() if e == L1Error.SUCCESS)
 
     @l1_mgr_synchronized
     def finish_write(
@@ -661,6 +802,10 @@ class L1Manager:
             KEY_IS_LOCKED: The key is locked (either write-locked or read-locked
                 and cannot be deleted).
         """
+        return self._delete_unlocked(keys)
+
+    def _delete_unlocked(self, keys: list[ObjectKey]) -> dict[ObjectKey, L1Error]:
+        """``delete`` for a caller that already holds the lock."""
         need_to_free: list[MemoryObj] = []
         ret: dict[ObjectKey, L1Error] = {}
         successful_keys: list[ObjectKey] = []
@@ -838,6 +983,8 @@ class L1Manager:
             "memory_usage_ratio": used / total if total > 0 else 0.0,
             "write_ttl_seconds": self._write_ttl_seconds,
             "read_ttl_seconds": self._read_ttl_seconds,
+            "reclaim_on_oom": self._reclaim_on_oom,
+            **({"reclaim": dict(self._reclaim_stats)} if self._reclaim_on_oom else {}),
         }
 
     # Debugging APIs

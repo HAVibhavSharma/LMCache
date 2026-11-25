@@ -105,6 +105,27 @@ class L1EvictionController(EvictionController):
         self._listener = L1EvictionPolicy(self._eviction_policy)
         self._l1_manager.register_listener(self._listener)
         self._event_bus = get_event_bus()
+        # Room on demand (LMCACHE_L1_RECLAIM_ON_OOM): a write reservation that
+        # does not fit evicts in this policy's order, the loop's own order.
+        self._l1_manager.set_reclaimer(self.reclaim_candidates)
+
+    def reclaim_candidates(self, count: int, held: int) -> list[ObjectKey]:
+        """Up to about ``count`` unlocked keys to evict, best first.
+
+        Runs under the L1Manager lock (from ``reserve_write``): the policy's
+        own lock is taken and released here, and ``is_key_evictable`` does not
+        take the L1Manager lock, so the lock order is the same as when
+        ``delete`` notifies the policy.
+        """
+        if count <= 0 or held <= 0:
+            return []
+        # The policy turns a ratio of the keys it tracks into a count, rounding
+        # down: ask for a little more than needed.
+        ratio = min(1.0, (count + max(2, count // 50)) / held)
+        actions = self._eviction_policy.get_eviction_actions(
+            ratio, key_eligible_filter=self._l1_manager.is_key_evictable
+        )
+        return [key for action in actions for key in action.keys]
 
     # Demand-aware eviction (``DemandLRU``): no-ops under any other policy.
     def tag_warm_keys(self, keys: list[ObjectKey], session_id: str) -> None:
